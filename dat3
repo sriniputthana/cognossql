@@ -112,7 +112,7 @@ property_dim AS (
         o.owner_id,
         o.owner_name,
         DECODE(p.management_type, 'M', 'Managed', 'F', 'Franchised', p.management_type) AS management_type,
-        p.currency_code AS property_currency,
+        COALESCE(p.currency_code, 'USD') AS property_currency,
         p.rooms_total
     FROM properties p
     LEFT JOIN brands b ON p.brand_id = b.brand_id
