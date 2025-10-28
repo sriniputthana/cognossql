@@ -1,0 +1,313 @@
+---Account tracking
+
+WITH
+params AS (
+    SELECT
+        :p_start_date::date                                 AS start_date,
+        :p_end_date::date                                   AS end_date,
+        :p_property_ids::int[]                              AS property_ids,
+        COALESCE(:p_property_all::boolean, FALSE)           AS property_all,
+        :p_brand_ids::int[]                                 AS brand_ids,
+        COALESCE(:p_brand_all::boolean, FALSE)              AS brand_all,
+        :p_region_ids::int[]                                AS region_ids,
+        COALESCE(:p_region_all::boolean, FALSE)             AS region_all,
+        :p_market_ids::int[]                                AS market_ids,
+        COALESCE(:p_market_all::boolean, FALSE)             AS market_all,
+        :p_owner_ids::int[]                                 AS owner_ids,
+        COALESCE(:p_owner_all::boolean, FALSE)              AS owner_all,
+        :p_management_types::text[]                         AS mgmt_types,
+        COALESCE(:p_management_all::boolean, FALSE)         AS mgmt_all,
+        :p_room_category_ids::int[]                         AS room_category_ids,
+        :p_channel_ids::int[]                               AS channel_ids,
+        :p_loyalty_levels::text[]                           AS loyalty_levels,
+        :p_booking_window_from::int                         AS booking_window_from,
+        :p_booking_window_to::int                           AS booking_window_to,
+        :p_rate_plan_ids::int[]                             AS rate_plan_ids,
+        :p_intermediary_ids::int[]                          AS intermediary_ids,
+        :p_trip_purposes::text[]                            AS trip_purposes,
+        :p_wholesaler_ids::int[]                            AS wholesaler_ids,
+        :p_currency_base::text                              AS currency_base,
+        -- column show/hide flags
+        COALESCE(:p_show_property::boolean, FALSE)          AS show_property,
+        COALESCE(:p_show_brand::boolean, FALSE)             AS show_brand,
+        COALESCE(:p_show_region::boolean, FALSE)            AS show_region,
+        COALESCE(:p_show_market::boolean, FALSE)            AS show_market,
+        COALESCE(:p_show_owner::boolean, FALSE)             AS show_owner,
+        COALESCE(:p_show_mgmt_type::boolean, FALSE)         AS show_mgmt_type,
+        COALESCE(:p_show_room_category::boolean, FALSE)     AS show_room_category,
+        COALESCE(:p_show_channel::boolean, FALSE)           AS show_channel,
+        COALESCE(:p_show_loyalty::boolean, FALSE)           AS show_loyalty,
+        COALESCE(:p_show_rate_plan::boolean, FALSE)         AS show_rate_plan,
+        COALESCE(:p_show_intermediary::boolean, FALSE)      AS show_intermediary,
+        COALESCE(:p_show_trip_purpose::boolean, FALSE)      AS show_trip_purpose,
+        COALESCE(:p_show_wholesaler::boolean, FALSE)        AS show_wholesaler,
+        COALESCE(:p_show_booking_date::boolean, TRUE)       AS show_booking_date
+),
+-- date_dim: expands the reporting date range into daily grain; change to month grain if needed
+date_dim AS (
+    SELECT
+        d::date AS stay_date,
+        EXTRACT(YEAR FROM d)::int AS stay_year,
+        EXTRACT(MONTH FROM d)::int AS stay_month,
+        TO_CHAR(d, 'YYYY-MM') AS year_month
+    FROM params, GENERATE_SERIES(params.start_date, params.end_date, INTERVAL '1 day') AS d
+),
+-- property_dim: normalize property attributes and join dims (brands, regions, owners, etc.)
+property_dim AS (
+    SELECT
+        p.property_id,
+        p.property_name,
+        b.brand_id,
+        b.brand_name,
+        r.region_id,
+        r.region_name,
+        mkt.market_id,
+        mkt.market_name,
+        o.owner_id,
+        o.owner_name,
+        p.management_type,
+        p.currency_code AS property_currency,
+        p.rooms_total
+    FROM properties p
+    LEFT JOIN brands b ON p.brand_id = b.brand_id
+    LEFT JOIN regions r ON p.region_id = r.region_id
+    LEFT JOIN markets mkt ON p.market_id = mkt.market_id
+    LEFT JOIN owners o ON p.owner_id = o.owner_id
+),
+-- capacity_agg: total available room nights per property in the date range
+capacity_agg AS (
+    SELECT
+        pd.property_id,
+        SUM(pd.rooms_total) AS total_rooms,                            -- rooms per day sum (constant per day multiplied by days below)
+        COUNT(dd.stay_date) AS days_in_range,
+        SUM(pd.rooms_total) * COUNT(dd.stay_date) AS total_room_nights
+    FROM property_dim pd
+    CROSS JOIN date_dim dd
+    GROUP BY pd.property_id
+),
+-- bookings_fact: base fact table containing bookings/stays; expected columns used below:
+--   booking_id, property_id, checkin_date, checkout_date, booking_date,
+--   room_revenue, addon_revenue, package_revenue, fee_amount, tax_amount, currency_code,
+--   room_category_id, channel_id, loyalty_level, rate_plan_id, intermediary_id, trip_purpose, wholesaler_id
+bookings_fact AS (
+    SELECT bf.*
+    FROM bookings bf
+    -- optional base-level filter: only bookings intersecting the date range
+    JOIN params p ON 1=1
+    WHERE bf.checkin_date <= p.end_date
+      AND bf.checkout_date > p.start_date
+),
+-- currency lookup: for each booking, find the latest rate record <= booking_date (LATERAL)
+booking_with_rates AS (
+    SELECT
+        b.*,
+        pd.property_name,
+        pd.brand_id,
+        pd.brand_name,
+        pd.region_id,
+        pd.region_name,
+        pd.market_id,
+        pd.market_name,
+        pd.owner_id,
+        pd.owner_name,
+        pd.management_type,
+        pd.property_currency,
+        ca.total_rooms,
+        ca.days_in_range,
+        ca.total_room_nights,
+        COALESCE(cr.rate_to_base, 1.0) AS rate_to_base -- convert booking currency to base (currency_base)
+    FROM bookings_fact b
+    LEFT JOIN property_dim pd ON b.property_id = pd.property_id
+    LEFT JOIN capacity_agg ca ON pd.property_id = ca.property_id
+    LEFT JOIN LATERAL (
+        SELECT cr.rate_to_base
+        FROM currency_rates cr
+        JOIN params prm ON 1=1
+        WHERE cr.currency_code = COALESCE(b.currency_code, pd.property_currency)
+          AND cr.rate_date <= b.booking_date
+          AND cr.base_currency = prm.currency_base
+        ORDER BY cr.rate_date DESC
+        LIMIT 1
+    ) cr ON TRUE
+)
+-- Final select: dynamic columns using CASE for inclusion and dynamic filtering using params
+SELECT
+    -- Dimension columns (included only if the corresponding show flag is true)
+    CASE WHEN (SELECT show_property FROM params) THEN bw.property_name ELSE NULL END AS property_name,
+    CASE WHEN (SELECT show_brand FROM params) THEN bw.brand_name ELSE NULL END AS brand_name,
+    CASE WHEN (SELECT show_region FROM params) THEN bw.region_name ELSE NULL END AS region_name,
+    CASE WHEN (SELECT show_market FROM params) THEN bw.market_name ELSE NULL END AS market_name,
+    CASE WHEN (SELECT show_owner FROM params) THEN bw.owner_name ELSE NULL END AS owner_name,
+    CASE WHEN (SELECT show_mgmt_type FROM params) THEN bw.management_type ELSE NULL END AS management_type,
+    CASE WHEN (SELECT show_room_category FROM params) THEN rc.category_name ELSE NULL END AS room_category,
+    CASE WHEN (SELECT show_channel FROM params) THEN ch.channel_name ELSE NULL END AS channel_name,
+    CASE WHEN (SELECT show_loyalty FROM params) THEN bw.loyalty_level ELSE NULL END AS loyalty_level,
+    CASE WHEN (SELECT show_rate_plan FROM params) THEN rp.rate_plan_name ELSE NULL END AS rate_plan_name,
+    CASE WHEN (SELECT show_intermediary FROM params) THEN i.intermediary_name ELSE NULL END AS intermediary_name,
+    CASE WHEN (SELECT show_trip_purpose FROM params) THEN bw.trip_purpose ELSE NULL END AS trip_purpose,
+    CASE WHEN (SELECT show_wholesaler FROM params) THEN w.wholesaler_name ELSE NULL END AS wholesaler_name,
+
+    -- Booking and date fields
+    CASE WHEN (SELECT show_booking_date FROM params) THEN bw.booking_date ELSE NULL END AS booking_date,
+    bw.checkin_date,
+    bw.checkout_date,
+
+    -- Derived metrics (always returned; set to 0 or NULL as appropriate)
+    -- Number of stay nights (checkout_date - checkin_date)
+    GREATEST((bw.checkout_date::date - bw.checkin_date::date), 0) AS stay_nights,
+
+    -- Monetary amounts in booking currency
+    bw.room_revenue           AS room_revenue_original,
+    bw.addon_revenue          AS addon_revenue_original,
+    bw.package_revenue        AS package_revenue_original,
+    bw.fee_amount             AS fee_amount_original,
+    bw.tax_amount             AS tax_amount_original,
+    bw.currency_code          AS booking_currency,
+
+    -- Converted to base currency using rate_to_base (e.g., USD)
+    -- rate_to_base converts booking currency --> params.currency_base
+    ROUND(bw.room_revenue * bw.rate_to_base::numeric, 2) AS room_revenue_base,
+    ROUND(bw.addon_revenue * bw.rate_to_base::numeric, 2) AS addon_revenue_base,
+    ROUND(bw.package_revenue * bw.rate_to_base::numeric, 2) AS package_revenue_base,
+    ROUND(bw.fee_amount * bw.rate_to_base::numeric, 2) AS fee_amount_base,
+    ROUND(bw.tax_amount * bw.rate_to_base::numeric, 2) AS tax_amount_base,
+
+    -- Aggregate metrics
+    ROUND( (bw.room_revenue + bw.addon_revenue + bw.package_revenue) * bw.rate_to_base::numeric, 2) AS total_revenue_base,
+
+    -- Capacity related metrics
+    bw.total_rooms,
+    bw.days_in_range,
+    bw.total_room_nights,
+
+    -- Occupancy calculations (example: room nights sold per property in this booking)
+    -- Note: For single booking, rooms_sold is 1 * stay_nights if one room per booking; adapt to occupancy logic in schema
+    GREATEST((bw.checkout_date::date - bw.checkin_date::date), 0) AS room_nights_sold,
+    CASE WHEN bw.total_room_nights > 0
+         THEN ROUND((GREATEST((bw.checkout_date::date - bw.checkin_date::date), 0)::numeric / NULLIF(bw.total_room_nights,0)) * 100, 4)
+         ELSE NULL END AS occupancy_pct
+
+FROM account_tracking bw
+-- joins to supporting dims used in CASE columns
+LEFT JOIN room_categories rc ON bw.room_category_id = rc.room_category_id
+LEFT JOIN channels ch ON bw.channel_id = ch.channel_id
+LEFT JOIN rate_plans rp ON bw.rate_plan_id = rp.rate_plan_id
+LEFT JOIN intermediaries i ON bw.intermediary_id = i.intermediary_id
+LEFT JOIN wholesalers w ON bw.wholesaler_id = w.wholesaler_id
+JOIN params prm ON 1=1
+
+WHERE
+    1=1
+    -- Property filter: include all or match list
+    AND (
+        prm.property_all
+        OR (prm.property_ids IS NOT NULL AND array_length(prm.property_ids,1) > 0 AND bw.property_id = ANY(prm.property_ids))
+    )
+
+    -- Brand filter
+    AND (
+        prm.brand_all
+        OR (prm.brand_ids IS NOT NULL AND array_length(prm.brand_ids,1) > 0 AND bw.brand_id = ANY(prm.brand_ids))
+    )
+
+    -- Region filter
+    AND (
+        prm.region_all
+        OR (prm.region_ids IS NOT NULL AND array_length(prm.region_ids,1) > 0 AND bw.region_id = ANY(prm.region_ids))
+    )
+
+    -- Market filter
+    AND (
+        prm.market_all
+        OR (prm.market_ids IS NOT NULL AND array_length(prm.market_ids,1) > 0 AND bw.market_id = ANY(prm.market_ids))
+    )
+
+    -- Owner filter
+    AND (
+        prm.owner_all
+        OR (prm.owner_ids IS NOT NULL AND array_length(prm.owner_ids,1) > 0 AND bw.owner_id = ANY(prm.owner_ids))
+    )
+
+    -- Management type filter (text multi-select)
+    AND (
+        prm.mgmt_all
+        OR (prm.mgmt_types IS NOT NULL AND array_length(prm.mgmt_types,1) > 0 AND bw.management_type = ANY(prm.mgmt_types))
+    )
+
+    -- Room category filter
+    AND (
+        prm.room_category_ids IS NULL
+        OR array_length(prm.room_category_ids,1) = 0
+        OR bw.room_category_id = ANY(prm.room_category_ids)
+    )
+
+    -- Channel filter
+    AND (
+        prm.channel_ids IS NULL
+        OR array_length(prm.channel_ids,1) = 0
+        OR bw.channel_id = ANY(prm.channel_ids)
+    )
+
+    -- Loyalty filter
+    AND (
+        prm.loyalty_levels IS NULL
+        OR array_length(prm.loyalty_levels,1) = 0
+        OR bw.loyalty_level = ANY(prm.loyalty_levels)
+    )
+
+    -- Booking window filter: days between booking_date and checkin_date
+    AND (
+        (prm.booking_window_from IS NULL AND prm.booking_window_to IS NULL)
+        OR (
+            (prm.booking_window_from IS NULL OR (bw.checkin_date::date - bw.booking_date::date) >= prm.booking_window_from)
+            AND (prm.booking_window_to IS NULL OR (bw.checkin_date::date - bw.booking_date::date) <= prm.booking_window_to)
+        )
+    )
+
+    -- Rate plan filter
+    AND (
+        prm.rate_plan_ids IS NULL
+        OR array_length(prm.rate_plan_ids,1) = 0
+        OR bw.rate_plan_id = ANY(prm.rate_plan_ids)
+    )
+
+    -- Intermediary filter
+    AND (
+        prm.intermediary_ids IS NULL
+        OR array_length(prm.intermediary_ids,1) = 0
+        OR bw.intermediary_id = ANY(prm.intermediary_ids)
+    )
+
+    -- Trip purpose filter
+    AND (
+        prm.trip_purposes IS NULL
+        OR array_length(prm.trip_purposes,1) = 0
+        OR bw.trip_purpose = ANY(prm.trip_purposes)
+    )
+
+    -- Wholesaler filter
+    AND (
+        prm.wholesaler_ids IS NULL
+        OR array_length(prm.wholesaler_ids,1) = 0
+        OR bw.wholesaler_id = ANY(prm.wholesaler_ids)
+    )
+
+    -- Stay date intersects the reporting date_dim (bookings that have any night in the requested date range)
+    AND (
+        bw.checkin_date <= prm.end_date
+        AND bw.checkout_date > prm.start_date
+    )
+
+-- Optional: group/aggregate if you want rolled-up results; otherwise this is at booking grain.
+-- Example grouping (uncomment and adapt as required):
+-- GROUP BY
+--   CASE WHEN (SELECT show_property FROM params) THEN bw.property_name ELSE NULL END,
+--   CASE WHEN (SELECT show_brand FROM params) THEN bw.brand_name ELSE NULL END,
+--   ... other shown fields ...
+-- ORDER BY property_name, booking_date;
+
+ORDER BY
+    COALESCE(bw.property_name, bw.property_id),
+    bw.booking_date;
+
+-- End of DAT3_Details.sql
