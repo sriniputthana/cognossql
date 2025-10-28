@@ -111,7 +111,11 @@ property_dim AS (
         mkt.market_name,
         o.owner_id,
         o.owner_name,
-        DECODE(p.management_type, 'M', 'Managed', 'F', 'Franchised', p.management_type) AS management_type,
+        CASE p.management_type 
+            WHEN 'M' THEN 'Managed'
+            WHEN 'F' THEN 'Franchised'
+            ELSE p.management_type
+        END AS management_type,
         COALESCE(p.currency_code, 'USD') AS property_currency,
         p.rooms_total
     FROM properties p
@@ -184,7 +188,13 @@ SELECT
     CASE WHEN (SELECT show_region FROM params) THEN bw.region_name ELSE NULL END AS region_name,
     CASE WHEN (SELECT show_market FROM params) THEN bw.market_name ELSE NULL END AS market_name,
     CASE WHEN (SELECT show_owner FROM params) THEN bw.owner_name ELSE NULL END AS owner_name,
-    CASE WHEN (SELECT show_mgmt_type FROM params) THEN DECODE(bw.management_type, 'M', 'Managed', 'F', 'Franchised', bw.management_type) ELSE NULL END AS management_type,
+    CASE WHEN (SELECT show_mgmt_type FROM params) THEN 
+        CASE bw.management_type 
+            WHEN 'M' THEN 'Managed'
+            WHEN 'F' THEN 'Franchised'
+            ELSE bw.management_type
+        END 
+    ELSE NULL END AS management_type,
     CASE WHEN (SELECT show_room_category FROM params) THEN rc.category_name ELSE NULL END AS room_category,
     CASE WHEN (SELECT show_channel FROM params) THEN ch.channel_name ELSE NULL END AS channel_name,
     CASE WHEN (SELECT show_loyalty FROM params) THEN bw.loyalty_level ELSE NULL END AS loyalty_level,
