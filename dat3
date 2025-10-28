@@ -23,7 +23,7 @@
 -- :p_market_all           BOOLEAN
 -- :p_owner_ids            INT[]
 -- :p_owner_all            BOOLEAN
--- :p_management_types     TEXT[]       -- e.g., ['FRANCHISE','MANAGED']
+-- :p_management_types     TEXT[]       -- e.g., ['FRANCHISE','MANAGED','OWNER']
 -- :p_management_all       BOOLEAN
 -- :p_room_category_ids    INT[]
 -- :p_channel_ids          INT[]
@@ -114,6 +114,7 @@ property_dim AS (
         CASE p.management_type 
             WHEN 'M' THEN 'Managed'
             WHEN 'F' THEN 'Franchised'
+            WHEN 'O' THEN 'Owner'
             ELSE p.management_type
         END AS management_type,
         COALESCE(p.currency_code, 'USD') AS property_currency,
@@ -192,6 +193,7 @@ SELECT
         CASE bw.management_type 
             WHEN 'M' THEN 'Managed'
             WHEN 'F' THEN 'Franchised'
+            WHEN 'O' THEN 'Owner'
             ELSE bw.management_type
         END 
     ELSE NULL END AS management_type,
