@@ -68,6 +68,7 @@ property_dim AS (
         CASE p.management_type 
             WHEN 'M' THEN 'Managed'
             WHEN 'F' THEN 'Franchised'
+            WHEN 'O' THEN 'Owner'
             ELSE p.management_type
         END AS management_type,
         COALESCE(p.currency_code, 'USD') AS property_currency,
@@ -146,6 +147,7 @@ SELECT
         CASE bw.management_type 
             WHEN 'M' THEN 'Managed'
             WHEN 'F' THEN 'Franchised'
+            WHEN 'O' THEN 'Owner'
             ELSE bw.management_type
         END 
     ELSE NULL END AS management_type,
